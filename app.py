@@ -1,169 +1,146 @@
-import os
-import io
-import tempfile
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import plotly.express as px
+from engine.pricing import run_audit
+from generate_data import create_synthetic_dataset # Generates sample data on the fly
 
-# Import core modules
-import generate_data
-from engine.pricing import audit_loan_data
-from engine.report_generator import generate_pdf_report
-
-
+# Page Layout Config
 st.set_page_config(
-    page_title="Mortgage Loan Pricing Audit Engine",
-    page_icon="🏦",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    page_title="Mortgage Pricing & Concession Audit Engine",
+    page_icon="📊",
+    layout="wide"
 )
 
+st.title("📊 Mortgage Pricing & Concession Audit Engine")
+st.caption("Identify secondary market revenue leakage, unbacked loan officer concessions, and CFPB fair-lending risks.")
 
-def run_pipeline(input_df: pd.DataFrame, concession_threshold: float):
-    """Executes audit calculations and generates PDF report bytes."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        input_csv_path = os.path.join(temp_dir, "input_locks.csv")
-        audited_csv_path = os.path.join(temp_dir, "audited_locks.csv")
-        pdf_report_path = os.path.join(temp_dir, "Audit_Summary.pdf")
+# --- Sidebar Configuration ---
+st.sidebar.header("⚙️ Audit Controls")
 
-        # Save uploaded dataframe to temporary CSV
-        input_df.to_csv(input_csv_path, index=False)
-
-        # Run core audit logic
-        audited_df, metrics = audit_loan_data(
-            input_csv_path=input_csv_path,
-            output_csv_path=audited_csv_path,
-            concession_threshold=concession_threshold,
-        )
-
-        # Generate PDF Report
-        generate_pdf_report(audited_df, metrics, output_pdf_path=pdf_report_path)
-
-        # Read generated PDF bytes for download
-        with open(pdf_report_path, "rb") as f:
-            pdf_bytes = f.read()
-
-    return audited_df, metrics, pdf_bytes
-
-
-# Sidebar Configuration
-st.sidebar.title("Configuration")
-st.sidebar.subheader("Audit Parameters")
-
-concession_threshold = st.sidebar.number_input(
-    "CFPB Concession Threshold (bps)",
-    min_value=0.0,
-    max_value=100.0,
+# Threshold Adjustment Slider
+cfpb_threshold = st.sidebar.slider(
+    "CFPB Risk Threshold (bps)",
+    min_value=5.0,
+    max_value=50.0,
     value=25.0,
-    step=5.0,
-    help="Flags loans exceeding this pricing concession threshold.",
+    step=2.5,
+    help="Flags any loan concession exceeding this basis point threshold for fair-lending review."
 )
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Data Input Options")
+st.sidebar.header("📁 Data Input")
 
-generate_mock_btn = st.sidebar.button("Generate Synthetic Data (500 Loans)")
+uploaded_file = st.sidebar.file_uploader("Upload Loan Locks (CSV)", type=["csv"])
+use_sample_data = st.sidebar.button("⚡ Load Demo Sample Dataset (500 Loans)")
 
-# Main Layout
-st.title("🏦 Mortgage Loan Pricing Audit Engine")
-st.markdown(
-    "Upload a loan lock dataset to evaluate interest rate variances, calculate financial leakage, "
-    "and identify regulatory compliance risks."
-)
-
-uploaded_file = st.file_uploader(
-    "Choose a Loan Lock CSV file", type=["csv"], help="Upload CSV containing loan lock details."
-)
-
-# Handle synthetic data trigger
-if generate_mock_btn:
-    os.makedirs("data", exist_ok=True)
-    mock_path = os.path.join("data", "synthetic_loan_locks.csv")
-    generate_data.create_synthetic_dataset(output_path=mock_path)
-    st.sidebar.success("Synthetic dataset generated in `data/synthetic_loan_locks.csv`")
-    uploaded_file = mock_path
+raw_df = None
 
 if uploaded_file is not None:
-    try:
-        if isinstance(uploaded_file, str):
-            df_raw = pd.read_csv(uploaded_file)
-        else:
-            df_raw = pd.read_csv(uploaded_file)
+    raw_df = pd.read_csv(uploaded_file)
+elif use_sample_data:
+    raw_df = create_synthetic_dataset(num_records=500)
+    st.sidebar.success("Loaded 500 sample loan locks.")
 
-        # Execute processing pipeline
-        audited_df, metrics, pdf_bytes = run_pipeline(df_raw, concession_threshold)
+# --- Main Dashboard Rendering ---
+if raw_df is not None:
+    # Run Audit Calculation Engine
+    results = run_audit(raw_df, cfpb_threshold_bps=cfpb_threshold)
+    
+    df = results["audited_df"]
+    lo_df = results["lo_breakdown"]
+    region_df = results["region_breakdown"]
+    product_df = results["product_breakdown"]
 
-        # Display Top KPI Metrics
-        st.subheader("Executive Audit Summary")
-        col1, col2, col3, col4 = st.columns(4)
+    # Region Sidebar Multi-select Filter
+    st.sidebar.markdown("---")
+    available_regions = df['region'].unique().tolist()
+    selected_regions = st.sidebar.multiselect(
+        "Filter Dashboard by Region",
+        options=available_regions,
+        default=available_regions
+    )
+    
+    # Filter dataset based on selected regions
+    filtered_df = df[df['region'].isin(selected_regions)]
+    filtered_results = run_audit(filtered_df, cfpb_threshold_bps=cfpb_threshold)
 
-        col1.metric("Total Loans Audited", f"{metrics['total_loans']:,}")
-        col2.metric("Total Financial Leakage", f"${metrics['total_leakage']:,.2f}")
-        col3.metric("Avg Rate Variance (bps)", f"{metrics['avg_rate_variance']:.2f}")
-        col4.metric(
-            "Non-Compliant Flags",
-            f"{metrics['flagged_loans_count']:,}",
-            delta=f"{(metrics['flagged_loans_count'] / metrics['total_loans']) * 100:.1f}% of total",
-            delta_color="inverse",
+    # --- Top Metric Cards ---
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Loans Audited", f"{len(filtered_df):,}")
+    col2.metric("Total Lock Volume", f"${filtered_df['loan_amount'].sum():,.2f}")
+    col3.metric("Revenue Leakage", f"${filtered_results['total_leakage']:,.2f}", delta_color="inverse")
+    col4.metric(f"CFPB Risk Flags (>{cfpb_threshold:.0f}bps)", f"{filtered_results['total_cfpb_flags']}", delta_color="inverse")
+
+    st.markdown("---")
+
+    # --- Multi-Tab View ---
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📍 Regional Analysis", 
+        "👤 Loan Officer Breakdown", 
+        "🏠 Product Type Analysis", 
+        "📄 Raw Audit Records"
+    ])
+
+    # TAB 1: REGIONAL BREAKDOWN
+    with tab1:
+        st.subheader("Margin Leakage & Compliance Risk by Region")
+        fig_region = px.bar(
+            filtered_results["region_breakdown"], 
+            x="region", 
+            y="total_leakage", 
+            color="cfpb_flag_count",
+            title="Total Dollar Leakage vs High Concession Flags by Region",
+            labels={
+                "total_leakage": "Leakage ($)", 
+                "region": "Region", 
+                "cfpb_flag_count": f"Flags (>{cfpb_threshold:.0f}bps)"
+            },
+            color_continuous_scale="Reds"
         )
+        st.plotly_chart(fig_region, use_container_width=True)
+        st.dataframe(filtered_results["region_breakdown"], use_container_width=True)
 
-        st.markdown("---")
-
-        # Visual Analytics Section
-        st.subheader("Financial Leakage & Compliance Analysis")
-        chart_col1, chart_col2 = st.columns(2)
-
-        with chart_col1:
-            st.markdown("**Rate Variance Distribution (bps)**")
-            if "rate_variance_bps" in audited_df.columns:
-                st.bar_chart(audited_df["rate_variance_bps"].value_counts().sort_index())
-            else:
-                st.line_chart(audited_df[["locked_rate", "target_rate"]])
-
-        with chart_col2:
-            st.markdown("**Leakage Amount by Compliance Status**")
-            leakage_by_status = audited_df.groupby("compliance_flag")["dollar_leakage"].sum()
-            st.bar_chart(leakage_by_status)
-
-        st.markdown("---")
-
-        # Detailed Data Table
-        st.subheader("Audited Loan Records")
-
-        show_flagged_only = st.checkbox("Show Non-Compliant Loans Only")
-        display_df = audited_df[audited_df["compliance_flag"] == True] if show_flagged_only else audited_df
-
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
+    # TAB 2: LOAN OFFICER BREAKDOWN
+    with tab2:
+        st.subheader("Top Concession Officers")
+        fig_lo = px.bar(
+            filtered_results["lo_breakdown"].head(10), 
+            x="total_leakage", 
+            y="loan_officer", 
+            orientation="h",
+            color="avg_concession_bps",
+            title="Top 10 Loan Officers by Total Revenue Leakage ($)",
+            labels={
+                "total_leakage": "Total Leakage ($)", 
+                "loan_officer": "Loan Officer", 
+                "avg_concession_bps": "Avg Concession (bps)"
+            },
+            color_continuous_scale="Oranges"
         )
+        fig_lo.update_layout(yaxis={'categoryorder': 'total ascending'})
+        st.plotly_chart(fig_lo, use_container_width=True)
+        st.dataframe(filtered_results["lo_breakdown"], use_container_width=True)
 
-        # Export Section
-        st.markdown("---")
-        st.subheader("Export Audit Reports")
-        dl_col1, dl_col2 = st.columns(2)
-
-        with dl_col1:
-            st.download_button(
-                label="📄 Download Executive Summary (PDF)",
-                data=pdf_bytes,
-                file_name="Executive_Audit_Summary.pdf",
-                mime="application/pdf",
-                use_container_width=True,
+    # TAB 3: PRODUCT TYPE BREAKDOWN
+    with tab3:
+        st.subheader("Leakage Distribution Across Product Types")
+        col_pie, col_table = st.columns([1, 1])
+        with col_pie:
+            fig_prod = px.pie(
+                filtered_results["product_breakdown"], 
+                names="product_type", 
+                values="total_leakage", 
+                title="Revenue Leakage Share by Product",
+                hole=0.4
             )
+            st.plotly_chart(fig_prod, use_container_width=True)
+        with col_table:
+            st.dataframe(filtered_results["product_breakdown"], use_container_width=True)
 
-        with dl_col2:
-            csv_buffer = io.StringIO()
-            audited_df.to_csv(csv_buffer, index=False)
-            st.download_button(
-                label="📊 Download Audited Dataset (CSV)",
-                data=csv_buffer.getvalue(),
-                file_name="audited_loan_locks.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+    # TAB 4: RAW AUDIT DATA TABLE
+    with tab4:
+        st.subheader("Detailed Audit Ledger")
+        st.dataframe(filtered_df, use_container_width=True)
 
-    except Exception as e:
-        st.error(f"Error processing audit pipeline: {str(e)}")
 else:
-    st.info("💡 Upload a CSV file using the sidebar or click **Generate Synthetic Data** to run a test audit.")
+    st.info("👈 Upload a loan lock CSV in the sidebar or click 'Load Demo Sample Dataset' to launch the audit engine.")
