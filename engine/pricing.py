@@ -1,54 +1,73 @@
 import pandas as pd
 import numpy as np
 
-
-def audit_loan_data(input_csv_path: str, output_csv_path: str = None, concession_threshold: float = 25.0):
+def run_audit(df: pd.DataFrame, cfpb_threshold_bps: float = 25.0) -> dict:
     """
-    Audits loan lock data by calculating target rates, rate variances, 
-    dollar leakage, and checking against CFPB concession thresholds.
+    Audits loan lock records against target pricing, calculates dollar leakage,
+    flags fair-lending risk based on a dynamic threshold, and aggregates metrics
+    across Loan Officers, Regions, and Product Types.
     """
-    df = pd.read_csv(input_csv_path)
+    audited_df = df.copy()
 
-    # 1. Ensure required columns exist with defaults if missing
-    if "base_rate" not in df.columns:
-        df["base_rate"] = 6.50
-    if "llpa_bps" not in df.columns:
-        df["llpa_bps"] = 0.0
-
-    # 2. Calculate Target Rate and Rate Variance
-    # LLPA (Loan-Level Price Adjustment) in bps converted to percentage (100 bps = 1.0%)
-    df["target_rate"] = df["base_rate"] + (df["llpa_bps"] / 100.0)
+    # Calculate total required LLPAs
+    audited_df['llpa_total'] = (
+        audited_df['llpa_credit_score'] + 
+        audited_df['llpa_ltv'] + 
+        audited_df['llpa_property_type']
+    )
     
-    # Rate variance in percentage points and basis points
-    df["rate_variance"] = df["locked_rate"] - df["target_rate"]
-    df["rate_variance_bps"] = (df["rate_variance"] * 100).round(2)
-
-    # 3. Calculate Financial Leakage (Dollar Leakage)
-    # Leakage occurs when locked_rate < target_rate (concession/unearned discount given)
-    df["dollar_leakage"] = np.where(
-        df["rate_variance"] < 0,
-        (abs(df["rate_variance"]) / 100.0) * df["loan_amount"],
+    # Calculate target rate (Base Market Rate + total LLPAs)
+    audited_df['target_rate'] = audited_df['base_rate'] + audited_df['llpa_total']
+    
+    # Calculate rate variance in basis points (Target Rate minus Locked Rate)
+    # Positive variance indicates a concession given to the borrower (leakage)
+    audited_df['rate_variance_bps'] = (audited_df['target_rate'] - audited_df['locked_rate']) * 100
+    
+    # Calculate dollar leakage for positive concessions
+    audited_df['dollar_leakage'] = np.where(
+        audited_df['rate_variance_bps'] > 0,
+        (audited_df['rate_variance_bps'] / 10000) * audited_df['loan_amount'],
         0.0
     )
+    
+    # Flag regulatory risk based on the configurable threshold
+    audited_df['cfpb_risk_flag'] = audited_df['rate_variance_bps'] > cfpb_threshold_bps
 
-    # 4. CFPB Concession / Compliance Flag (> threshold bps discount)
-    # Negative variance beyond threshold indicates non-compliance
-    df["compliance_flag"] = df["rate_variance_bps"] < -concession_threshold
+    # --- Group Aggregations ---
 
-    # 5. Save output if destination path is specified
-    if output_csv_path:
-        df.to_csv(output_csv_path, index=False)
+    # 1. Loan Officer Breakdown
+    lo_breakdown = audited_df.groupby('loan_officer').agg(
+        total_loans=('loan_id', 'count'),
+        total_volume=('loan_amount', 'sum'),
+        total_leakage=('dollar_leakage', 'sum'),
+        avg_concession_bps=('rate_variance_bps', 'mean'),
+        cfpb_flag_count=('cfpb_risk_flag', 'sum')
+    ).reset_index().sort_values(by='total_leakage', ascending=False)
 
-    # 6. Aggregate Summary Metrics
-    metrics = {
-        "total_loans": int(len(df)),
-        "total_leakage": float(df["dollar_leakage"].sum()),
-        "avg_rate_variance": float(df["rate_variance_bps"].mean()),
-        "flagged_loans_count": int(df["compliance_flag"].sum()),
+    # 2. Region / Branch Breakdown
+    region_breakdown = audited_df.groupby('region').agg(
+        total_loans=('loan_id', 'count'),
+        total_volume=('loan_amount', 'sum'),
+        total_leakage=('dollar_leakage', 'sum'),
+        avg_concession_bps=('rate_variance_bps', 'mean'),
+        cfpb_flag_count=('cfpb_risk_flag', 'sum')
+    ).reset_index().sort_values(by='total_leakage', ascending=False)
+
+    # 3. Product Type Breakdown
+    product_breakdown = audited_df.groupby('product_type').agg(
+        total_loans=('loan_id', 'count'),
+        total_volume=('loan_amount', 'sum'),
+        total_leakage=('dollar_leakage', 'sum'),
+        avg_concession_bps=('rate_variance_bps', 'mean'),
+        cfpb_flag_count=('cfpb_risk_flag', 'sum')
+    ).reset_index().sort_values(by='total_leakage', ascending=False)
+
+    return {
+        "audited_df": audited_df,
+        "lo_breakdown": lo_breakdown,
+        "region_breakdown": region_breakdown,
+        "product_breakdown": product_breakdown,
+        "total_leakage": audited_df['dollar_leakage'].sum(),
+        "total_cfpb_flags": audited_df['cfpb_risk_flag'].sum(),
+        "cfpb_threshold_bps": cfpb_threshold_bps
     }
-
-    return df, metrics
-
-
-# Backwards compatibility alias if referenced as audit_pricing
-audit_pricing = audit_loan_data
