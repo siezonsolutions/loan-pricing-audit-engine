@@ -1,29 +1,47 @@
-# generate_data.py
 import pandas as pd
 import numpy as np
 
-def generate_synthetic_loans(num_records=500, filename="data/synthetic_loan_locks.csv"):
-    np.random.seed(42)
+def create_synthetic_dataset(num_records=500):
+    """Generates synthetic loan lock data for testing the audit engine."""
+    np.random.seed(42)  # For reproducible sample data
     
-    base_rates = np.random.choice([6.0, 6.25, 6.50, 6.75, 7.0], size=num_records)
-    upbs = np.random.choice([250000, 350000, 450000, 550000, 650000], size=num_records)
-    llpas = np.random.choice([0.0, 0.25, 0.50, 0.75, 1.0], size=num_records)
+    regions = ['North', 'South', 'East', 'West']
+    product_types = ['Conventional', 'FHA', 'VA']
+    loan_officers = [f"LO_{i:02d}" for i in range(1, 16)]
     
-    # Intentionally inject rate leakage into ~15% of records
-    locked_rates = base_rates + (llpas * 0.25)
-    leak_indices = np.random.choice(num_records, size=int(num_records * 0.15), replace=False)
-    locked_rates[leak_indices] -= np.random.choice([0.25, 0.375, 0.50], size=len(leak_indices))
+    data = {
+        'loan_id': [f"LN{100000 + i}" for i in range(num_records)],
+        'region': np.random.choice(regions, size=num_records),
+        'product_type': np.random.choice(product_types, size=num_records, p=[0.6, 0.25, 0.15]),
+        'loan_officer': np.random.choice(loan_officers, size=num_records),
+        'loan_amount': np.random.choice(np.arange(150000, 750000, 25000), size=num_records),
+        'base_rate': np.random.uniform(5.5, 6.25, size=num_records).round(3),
+        'llpa_credit_score': np.random.choice([0.0, 0.125, 0.25, 0.375, 0.5], size=num_records),
+        'llpa_ltv': np.random.choice([0.0, 0.125, 0.25, 0.5], size=num_records),
+        'llpa_property_type': np.random.choice([0.0, 0.125, 0.25], size=num_records, p=[0.7, 0.2, 0.1]),
+    }
+    
+    df = pd.DataFrame(data)
+    
+    # Calculate required target rate (Base Rate + Total LLPAs)
+    llpa_sum = df['llpa_credit_score'] + df['llpa_ltv'] + df['llpa_property_type']
+    target_rate = df['base_rate'] + llpa_sum
+    
+    # Simulate realistic rate locks (including concessions/variances)
+    concessions = np.random.choice(
+        [0.0, 0.125, 0.25, 0.375, 0.5], 
+        size=num_records, 
+        p=[0.5, 0.25, 0.15, 0.07, 0.03]
+    )
+    df['locked_rate'] = (target_rate - concessions).round(3)
+    
+    return df
 
-    df = pd.DataFrame({
-        "loan_id": [f"LN{10000 + i}" for i in range(num_records)],
-        "upb": upbs,
-        "base_rate": base_rates,
-        "total_llpas": llpas,
-        "locked_rate": locked_rates
-    })
-
-    df.to_csv(filename, index=False)
-    print(f"Generated {num_records} synthetic loan records at: {filename}")
+# Helper alias so running `python generate_data.py` directly still creates the CSV file
+def generate_synthetic_loans():
+    df = create_synthetic_dataset()
+    df.to_csv("data/synthetic_loan_locks.csv", index=False)
+    print("Generated 500 synthetic loan records at: data/synthetic_loan_locks.csv")
 
 if __name__ == "__main__":
     generate_synthetic_loans()
